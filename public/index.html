@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Send-it-easy</title>
+  <style>
+    :root { color-scheme: dark; font-family: system-ui, -apple-system, "Segoe UI", sans-serif; background: #10131a; color: #edf1f7; }
+    body { margin: 0; min-height: 100vh; background: radial-gradient(circle at top right, #26395a, transparent 45%), #10131a; }
+    main { width: min(900px, calc(100% - 32px)); margin: 0 auto; padding: 48px 0; }
+    h1 { margin: 0 0 8px; font-size: clamp(2rem, 6vw, 4rem); letter-spacing: -0.06em; }
+    .subtitle { color: #aab6ca; margin: 0 0 32px; font-size: 1.1rem; }
+    section { background: rgba(24, 29, 40, .9); border: 1px solid #313b4f; border-radius: 20px; padding: 24px; margin-top: 20px; box-shadow: 0 12px 35px rgba(0,0,0,.18); }
+    .code { color: #9ee6b5; font: 700 1.5rem ui-monospace, SFMono-Regular, Consolas, monospace; letter-spacing: .15em; }
+    .drop { display: block; border: 2px dashed #526886; border-radius: 16px; padding: 36px 20px; text-align: center; cursor: pointer; transition: .2s; }
+    .drop:hover, .drop.dragging { border-color: #8ab4ff; background: #202d44; }
+    input[type=file] { display: none; }
+    button { background: #8ab4ff; border: 0; color: #10131a; border-radius: 10px; padding: 10px 16px; font: inherit; font-weight: 700; cursor: pointer; }
+    button:disabled { opacity: .5; cursor: wait; }
+    .files { display: grid; gap: 10px; margin-top: 18px; }
+    .file { display: flex; justify-content: space-between; align-items: center; gap: 16px; background: #202735; border-radius: 12px; padding: 12px 14px; }
+    .file-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .meta, .status { color: #aab6ca; font-size: .9rem; }
+    progress { width: 100%; height: 10px; margin-top: 16px; accent-color: #8ab4ff; }
+    .empty { color: #7f8ba0; text-align: center; padding: 16px; }
+    .error { color: #ff9e9e; margin-top: 12px; }
+    .login { max-width: 420px; margin: 48px auto; text-align: center; }
+    .login input { box-sizing: border-box; width: 100%; margin: 18px 0 12px; padding: 13px 14px; border: 1px solid #526886; border-radius: 10px; background: #10131a; color: #edf1f7; font: 1.2rem ui-monospace, SFMono-Regular, Consolas, monospace; text-align: center; letter-spacing: .15em; }
+    .topbar { display: flex; justify-content: space-between; gap: 16px; align-items: center; }
+    .topbar h1 { font-size: clamp(2rem, 5vw, 3.5rem); }
+  </style>
+</head>
+<body>
+  <main id="loginView" class="login">
+    <h1>Send-it-easy</h1>
+    <p class="subtitle">Enter the access code shown on the host computer.</p>
+    <section>
+      <form id="loginForm">
+        <label class="meta" for="accessCode">Access code</label>
+        <input id="accessCode" inputmode="text" autocomplete="off" maxlength="32" required autofocus>
+        <button type="submit">Connect</button>
+        <div class="error" id="loginError"></div>
+      </form>
+    </section>
+  </main>
+  <main id="appView" hidden>
+    <div class="topbar"><div><h1>Send-it-easy</h1><p class="subtitle">Share files with devices on this Wi-Fi network.</p></div><button id="logout">Disconnect</button></div>
+    <section>
+      <label class="drop" id="drop">
+        <input id="picker" type="file" multiple>
+        <strong>Choose files or drag them here</strong><br>
+        <span class="meta">Files are saved to the host's shared folder.</span>
+      </label>
+      <progress id="progress" value="0" max="100" hidden></progress>
+      <div class="status" id="status"></div>
+      <div class="error" id="error"></div>
+    </section>
+    <section>
+      <h2>Available files</h2>
+      <div class="files" id="files"><div class="empty">Loading files…</div></div>
+    </section>
+  </main>
+  <script>
+    const loginView = document.querySelector("#loginView");
+    const appView = document.querySelector("#appView");
+    const loginForm = document.querySelector("#loginForm");
+    const loginError = document.querySelector("#loginError");
+    const picker = document.querySelector("#picker");
+    const drop = document.querySelector("#drop");
+    const progress = document.querySelector("#progress");
+    const status = document.querySelector("#status");
+    const error = document.querySelector("#error");
+
+    function showApp() {
+      loginView.hidden = true;
+      appView.hidden = false;
+      loadFiles().catch((reason) => error.textContent = reason.message);
+    }
+    async function checkSession() {
+      const response = await fetch("/api/files");
+      if (response.ok) showApp();
+    }
+    loginForm.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      loginError.textContent = "";
+      const response = await fetch("/api/login", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ code: document.querySelector("#accessCode").value.trim() })
+      });
+      if (!response.ok) {
+        loginError.textContent = (await response.json()).error;
+        return;
+      }
+      showApp();
+    });
+    document.querySelector("#logout").addEventListener("click", async () => {
+      await fetch("/api/logout", { method: "POST" });
+      location.reload();
+    });
+    function formatSize(bytes) {
+      if (bytes < 1024) return `${bytes} B`;
+      const units = ["KB", "MB", "GB"];
+      let value = bytes / 1024, unit = 0;
+      while (value >= 1024 && unit < units.length - 1) { value /= 1024; unit++; }
+      return `${value.toFixed(value >= 10 ? 0 : 1)} ${units[unit]}`;
+    }
+    async function loadFiles() {
+      const response = await fetch("/api/files");
+      if (!response.ok) throw new Error((await response.json()).error);
+      const { files } = await response.json();
+      const container = document.querySelector("#files");
+      container.replaceChildren();
+      if (!files.length) { container.innerHTML = '<div class="empty">No files shared yet.</div>'; return; }
+      for (const file of files) {
+        const row = document.createElement("div");
+        row.className = "file";
+        row.innerHTML = `<div><div class="file-name"></div><div class="meta">${formatSize(file.size)}</div></div>`;
+        row.querySelector(".file-name").textContent = file.name;
+        const link = document.createElement("a");
+        link.href = `/download/${encodeURIComponent(file.name)}`;
+        link.innerHTML = "<button>Download</button>";
+        row.append(link);
+        container.append(row);
+      }
+    }
+    function upload(file) {
+      return new Promise((resolve, reject) => {
+        const request = new XMLHttpRequest();
+        request.open("POST", `/api/upload?filename=${encodeURIComponent(file.name)}`);
+        request.upload.onprogress = (event) => {
+          if (event.lengthComputable) progress.value = (event.loaded / event.total) * 100;
+        };
+        request.onload = () => request.status >= 200 && request.status < 300
+          ? resolve() : reject(new Error(JSON.parse(request.responseText).error || "Upload failed."));
+        request.onerror = () => reject(new Error("The upload could not reach the host."));
+        request.send(file);
+      });
+    }
+    async function uploadFiles(files) {
+      error.textContent = "";
+      progress.hidden = false;
+      for (const file of files) {
+        status.textContent = `Uploading ${file.name}…`;
+        try { await upload(file); } catch (reason) { error.textContent = reason.message; break; }
+      }
+      status.textContent = "Ready";
+      progress.hidden = true;
+      await loadFiles();
+    }
+    picker.addEventListener("change", () => uploadFiles(picker.files));
+    ["dragenter", "dragover"].forEach((event) => drop.addEventListener(event, (e) => { e.preventDefault(); drop.classList.add("dragging"); }));
+    ["dragleave", "drop"].forEach((event) => drop.addEventListener(event, (e) => { e.preventDefault(); drop.classList.remove("dragging"); }));
+    drop.addEventListener("drop", (event) => uploadFiles(event.dataTransfer.files));
+    checkSession();
+  </script>
+</body>
+</html>

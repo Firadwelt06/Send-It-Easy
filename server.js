@@ -1,0 +1,257 @@
+const http = require("http");
+const fs = require("fs");
+const path = require("path");
+const os = require("os");
+const crypto = require("crypto");
+const { URL } = require("url");
+
+const PORT = Number(process.env.PORT) || 8080;
+const HOST = process.env.HOST || "0.0.0.0";
+const SHARED_DIR = path.join(__dirname, "shared");
+const INDEX_FILE = path.join(__dirname, "public", "index.html");
+const ACCESS_CODE = process.env.ACCESS_CODE || crypto.randomBytes(3).toString("hex").toUpperCase();
+const MAX_FILE_SIZE = 5 * 1024 * 1024 * 1024;
+const SESSION_MAX_AGE = 8 * 60 * 60 * 1000;
+const HOTSPOT_ADDRESS = process.env.HOTSPOT_ADDRESS || "192.168.137.1";
+const sessions = new Map();
+
+fs.mkdirSync(SHARED_DIR, { recursive: true });
+
+function getLocalAddresses() {
+  const addresses = [];
+  for (const interfaces of Object.values(os.networkInterfaces())) {
+    for (const network of interfaces || []) {
+      if (network.family === "IPv4" && !network.internal) {
+        addresses.push(network.address);
+      }
+    }
+  }
+  return addresses;
+}
+
+function describeAddress(address) {
+  if (address.startsWith("192.168.137.")) return "Windows hotspot";
+  if (address.startsWith("192.168.")) return "Wi-Fi/LAN";
+  return "Local network";
+}
+
+function getSession(request) {
+  const cookie = request.headers.cookie || "";
+  const token = cookie.split(";").map((part) => part.trim())
+    .find((part) => part.startsWith("send_it_easy_session="))
+    ?.split("=")[1];
+  if (!token || !sessions.has(token)) return false;
+  const expiresAt = sessions.get(token);
+  if (expiresAt <= Date.now()) {
+    sessions.delete(token);
+    return false;
+  }
+  return true;
+}
+
+function codesMatch(value) {
+  const received = Buffer.from(String(value || ""));
+  const expected = Buffer.from(ACCESS_CODE);
+  return received.length === expected.length && crypto.timingSafeEqual(received, expected);
+}
+
+function sendJson(response, statusCode, payload) {
+  const body = JSON.stringify(payload);
+  response.writeHead(statusCode, {
+    "Content-Type": "application/json; charset=utf-8",
+    "Content-Length": Buffer.byteLength(body),
+    "Cache-Control": "no-store"
+  });
+  response.end(body);
+}
+
+function safeFileName(value) {
+  const name = path.basename(String(value || "file"));
+  const cleaned = name.replace(/[<>:"/\\|?*\u0000-\u001f]/g, "_").trim();
+  return cleaned || "file";
+}
+
+function uniquePath(fileName) {
+  const extension = path.extname(fileName);
+  const stem = path.basename(fileName, extension);
+  let candidate = path.join(SHARED_DIR, fileName);
+  let index = 1;
+  while (fs.existsSync(candidate)) {
+    candidate = path.join(SHARED_DIR, `${stem} (${index})${extension}`);
+    index += 1;
+  }
+  return candidate;
+}
+
+function listFiles() {
+  return fs.readdirSync(SHARED_DIR, { withFileTypes: true })
+    .filter((entry) => entry.isFile() && entry.name !== ".gitkeep")
+    .map((entry) => {
+      const filePath = path.join(SHARED_DIR, entry.name);
+      const stats = fs.statSync(filePath);
+      return {
+        name: entry.name,
+        size: stats.size,
+        modified: stats.mtime.toISOString()
+      };
+    })
+    .sort((a, b) => a.name.localeCompare(b.name));
+}
+
+function serveIndex(response) {
+  fs.createReadStream(INDEX_FILE)
+    .on("error", () => sendJson(response, 500, { error: "Unable to load the web interface." }))
+    .once("open", () => {
+      response.writeHead(200, {
+        "Content-Type": "text/html; charset=utf-8",
+        "Cache-Control": "no-store"
+      });
+    })
+    .pipe(response);
+}
+
+function handleUpload(request, response, url) {
+  const requestedName = safeFileName(url.searchParams.get("filename"));
+  const destination = uniquePath(requestedName);
+  const writeStream = fs.createWriteStream(destination, { flags: "wx" });
+  let bytes = 0;
+  let failed = false;
+
+  request.on("data", (chunk) => {
+    bytes += chunk.length;
+    if (bytes > MAX_FILE_SIZE && !failed) {
+      failed = true;
+      writeStream.destroy();
+      request.resume();
+      fs.rm(destination, { force: true }, () => {
+        sendJson(response, 413, { error: "Files must be 5 GB or smaller." });
+      });
+      return;
+    }
+    if (!failed && !writeStream.write(chunk)) request.pause();
+  });
+  writeStream.on("drain", () => request.resume());
+  request.on("end", () => {
+    if (failed) return;
+    writeStream.end(() => sendJson(response, 201, {
+      name: path.basename(destination),
+      size: bytes
+    }));
+  });
+  request.on("error", () => {
+    if (!failed) {
+      failed = true;
+      writeStream.destroy();
+      fs.rm(destination, { force: true }, () => sendJson(response, 500, { error: "The upload was interrupted." }));
+    }
+  });
+  writeStream.on("error", (error) => {
+    if (!failed) {
+      failed = true;
+      request.destroy();
+      fs.rm(destination, { force: true }, () => {
+        const status = error.code === "ENOSPC" ? 507 : 500;
+        sendJson(response, status, { error: "The file could not be saved." });
+      });
+    }
+  });
+}
+
+const server = http.createServer((request, response) => {
+  const url = new URL(request.url, `http://${request.headers.host || "localhost"}`);
+
+  if (request.method === "GET" && url.pathname === "/") {
+    serveIndex(response);
+    return;
+  }
+
+  if (request.method === "POST" && url.pathname === "/api/login") {
+    let body = "";
+    request.setEncoding("utf8");
+    request.on("data", (chunk) => { body += chunk; });
+    request.on("end", () => {
+      let payload;
+      try {
+        payload = JSON.parse(body);
+      } catch {
+        sendJson(response, 400, { error: "Invalid login request." });
+        return;
+      }
+      if (!codesMatch(payload.code)) {
+        sendJson(response, 401, { error: "That access code is incorrect." });
+        return;
+      }
+      const token = crypto.randomBytes(32).toString("hex");
+      sessions.set(token, Date.now() + SESSION_MAX_AGE);
+      response.writeHead(200, {
+        "Content-Type": "application/json; charset=utf-8",
+        "Set-Cookie": `send_it_easy_session=${token}; HttpOnly; SameSite=Strict; Max-Age=${SESSION_MAX_AGE / 1000}; Path=/`,
+        "Cache-Control": "no-store"
+      });
+      response.end(JSON.stringify({ ok: true }));
+    });
+    return;
+  }
+
+  if (request.method === "POST" && url.pathname === "/api/logout") {
+    const cookie = request.headers.cookie || "";
+    const token = cookie.split(";").map((part) => part.trim())
+      .find((part) => part.startsWith("send_it_easy_session="))
+      ?.split("=")[1];
+    if (token) sessions.delete(token);
+    response.writeHead(200, {
+      "Content-Type": "application/json; charset=utf-8",
+      "Set-Cookie": "send_it_easy_session=; HttpOnly; SameSite=Strict; Max-Age=0; Path=/",
+      "Cache-Control": "no-store"
+    });
+    response.end(JSON.stringify({ ok: true }));
+    return;
+  }
+
+  if (!getSession(request)) {
+    sendJson(response, 401, { error: "Enter the access code shown on the host computer." });
+    return;
+  }
+
+  if (request.method === "GET" && url.pathname === "/api/files") {
+    sendJson(response, 200, { files: listFiles() });
+    return;
+  }
+
+  if (request.method === "POST" && url.pathname === "/api/upload") {
+    handleUpload(request, response, url);
+    return;
+  }
+
+  if (request.method === "GET" && url.pathname.startsWith("/download/")) {
+    const requestedName = safeFileName(decodeURIComponent(url.pathname.slice("/download/".length)));
+    const filePath = path.join(SHARED_DIR, requestedName);
+    if (!filePath.startsWith(`${SHARED_DIR}${path.sep}`) || !fs.existsSync(filePath)) {
+      sendJson(response, 404, { error: "File not found." });
+      return;
+    }
+    response.writeHead(200, {
+      "Content-Type": "application/octet-stream",
+      "Content-Disposition": `attachment; filename="${requestedName.replace(/"/g, "")}"`,
+      "Content-Length": fs.statSync(filePath).size
+    });
+    fs.createReadStream(filePath).pipe(response);
+    return;
+  }
+
+  sendJson(response, 404, { error: "Not found." });
+});
+
+server.listen(PORT, HOST, () => {
+  const addresses = getLocalAddresses();
+  console.log(`\nSend-it-easy is sharing: ${SHARED_DIR}`);
+  console.log(`Access code: ${ACCESS_CODE}`);
+  console.log(`This computer: http://localhost:${PORT}`);
+  if (process.platform === "win32" && !addresses.includes(HOTSPOT_ADDRESS)) {
+    console.log(`Windows hotspot (when enabled): http://${HOTSPOT_ADDRESS}:${PORT}`);
+  }
+  for (const address of addresses) {
+    console.log(`${describeAddress(address)}: http://${address}:${PORT}`);
+  }
+  console.log("\nPress Ctrl+C to stop sharing. This disconnects all devices and stops the server.\n");
+});
