@@ -2,6 +2,8 @@
 
 A small browser-based file transfer server for devices on the same Wi-Fi network.
 
+Version 2 adds local terminal QR codes so devices can open the correct connection address by scanning instead of typing it.
+
 ## Run
 
 Requires Node.js 18 or newer.
@@ -10,7 +12,7 @@ Requires Node.js 18 or newer.
 npm start
 ```
 
-The terminal prints the access code and addresses to open on another device. Open the address without adding the code; the browser will show a login page. Files uploaded through the browser are stored in `shared\`.
+The terminal prints the access code and addresses to open on another device. It also prints a QR code for each address. Scan the QR code with the other device's camera to open the sharing page without typing the address. Open the address without adding the code; the browser will show a login page. Files uploaded through the browser are stored in `shared\`.
 
 If Windows Firewall prompts for access, allow Node.js on **Private networks** only. Stop the server with `Ctrl+C`.
 
@@ -50,5 +52,6 @@ The defaults are suitable for a home network:
 - Access code: generated at each start (override with `ACCESS_CODE=MYCODE`)
 - Shared folder: `shared\`
 - Login session: expires after 8 hours or when the user selects **Disconnect**
+- QR codes: generated locally in the terminal for each detected address
 
 The current version intentionally shares only the configured shared folder and limits individual files to 5 GB.

@@ -4,6 +4,7 @@ const path = require("path");
 const os = require("os");
 const crypto = require("crypto");
 const { URL } = require("url");
+const qrcode = require("qrcode-terminal");
 
 const PORT = Number(process.env.PORT) || 8080;
 const HOST = process.env.HOST || "0.0.0.0";
@@ -33,6 +34,12 @@ function describeAddress(address) {
   if (address.startsWith("192.168.137.")) return "Windows hotspot";
   if (address.startsWith("192.168.")) return "Wi-Fi/LAN";
   return "Local network";
+}
+
+function printConnection(address, label) {
+  const url = `http://${address}:${PORT}`;
+  console.log(`${label}: ${url}`);
+  qrcode.generate(url, { small: true });
 }
 
 function getSession(request) {
@@ -248,10 +255,10 @@ server.listen(PORT, HOST, () => {
   console.log(`Access code: ${ACCESS_CODE}`);
   console.log(`This computer: http://localhost:${PORT}`);
   if (process.platform === "win32" && !addresses.includes(HOTSPOT_ADDRESS)) {
-    console.log(`Windows hotspot (when enabled): http://${HOTSPOT_ADDRESS}:${PORT}`);
+    printConnection(HOTSPOT_ADDRESS, "Windows hotspot (when enabled)");
   }
   for (const address of addresses) {
-    console.log(`${describeAddress(address)}: http://${address}:${PORT}`);
+    printConnection(address, describeAddress(address));
   }
   console.log("\nPress Ctrl+C to stop sharing. This disconnects all devices and stops the server.\n");
 });
