@@ -1,4 +1,5 @@
 const http = require("http");
+const { execFileSync } = require("child_process");
 const fs = require("fs");
 const path = require("path");
 const os = require("os");
@@ -16,7 +17,8 @@ const MAX_FILE_SIZE = 5 * 1024 * 1024 * 1024;
 const SESSION_MAX_AGE = 8 * 60 * 60 * 1000;
 const HOTSPOT_ADDRESS = process.env.HOTSPOT_ADDRESS || "192.168.137.1";
 const SERVICE_NAME = process.env.SERVICE_NAME || "Send-it-easy";
-const LOCAL_HOSTNAME = `${os.hostname().toLowerCase().replace(/[^a-z0-9-]/g, "-")}.local`;
+const HOSTNAME_BASE = process.env.LOCAL_HOSTNAME || os.hostname();
+const LOCAL_HOSTNAME = `${HOSTNAME_BASE.toLowerCase().replace(/[^a-z0-9-]/g, "-").replace(/^-+|-+$/g, "") || "send-it-easy"}.local`;
 const sessions = new Map();
 
 fs.mkdirSync(SHARED_DIR, { recursive: true });
@@ -31,6 +33,42 @@ function getLocalAddresses() {
     }
   }
   return addresses;
+}
+
+function getNetworkSummary() {
+  return Object.entries(os.networkInterfaces()).flatMap(([name, interfaces]) =>
+    (interfaces || [])
+      .filter((network) => network.family === "IPv4" && !network.internal)
+      .map((network) => ({
+        interface: name,
+        address: network.address,
+        netmask: network.netmask
+      }))
+  );
+}
+
+function printNetworkSummary() {
+  console.log("\nNetwork interfaces:");
+  const interfaces = getNetworkSummary();
+  if (!interfaces.length) {
+    console.log("  No non-loopback IPv4 interfaces detected.");
+  } else {
+    for (const network of interfaces) {
+      console.log(`  ${describeAddress(network.address)} | ${network.interface} | ${network.address} | mask ${network.netmask}`);
+    }
+  }
+
+  if (process.platform !== "win32") {
+    console.log("\nConnected-device table: available through the operating system's network tools.");
+    return;
+  }
+  try {
+    const arpOutput = execFileSync("arp", ["-a"], { encoding: "utf8", windowsHide: true });
+    console.log("\nDevices visible in Windows ARP table:");
+    console.log(arpOutput.trim() || "  No devices are currently visible.");
+  } catch (error) {
+    console.error(`\nCould not read the Windows ARP table: ${error.message}`);
+  }
 }
 
 function describeAddress(address) {
@@ -49,6 +87,11 @@ function printFriendlyConnection() {
   const url = `http://${LOCAL_HOSTNAME}:${PORT}`;
   console.log(`Friendly address (mDNS, if supported): ${url}`);
   qrcode.generate(url, { small: true });
+}
+
+if (process.argv.includes("--list-networks")) {
+  printNetworkSummary();
+  process.exit(0);
 }
 
 function getSession(request) {

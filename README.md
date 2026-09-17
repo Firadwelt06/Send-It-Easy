@@ -2,7 +2,7 @@
 
 A small browser-based file transfer server for devices on the same Wi-Fi network.
 
-Version 3 adds local mDNS discovery and a friendly `.local` address, while retaining QR and IP fallbacks.
+Version 3.1 adds configurable local naming and network inspection, while retaining QR, mDNS, and IP fallbacks.
 
 ## Run
 
@@ -15,6 +15,14 @@ npm start
 The terminal prints the access code and addresses to open on another device. It also prints a QR code for each address. Scan the QR code with the other device's camera to open the sharing page without typing the address. Open the address without adding the code; the browser will show a login page. Files uploaded through the browser are stored in `shared\`.
 
 The terminal also prints a friendly address like `http://your-computer.local:8080` and advertises Send-it-easy using mDNS. This works when the network and device support local mDNS discovery. If it does not resolve, use the hotspot/Wi-Fi IP address or its QR code.
+
+To list the computer's network interfaces and devices currently visible to Windows, run:
+
+```powershell
+npm run networks
+```
+
+The device table is based on Windows' ARP cache. It is not a guaranteed complete list; a device may appear only after communicating with the computer.
 
 If Windows Firewall prompts for access, allow Node.js on **Private networks** only. Stop the server with `Ctrl+C`.
 
@@ -46,6 +54,16 @@ npm start
 
 The server advertises an mDNS service named `Send-it-easy` and prints a hostname based on the computer name. The `.local` address is convenient, but it is not guaranteed on every Windows hotspot or client device. Keep using the printed IP address or QR code when the friendly address does not resolve.
 
+Customize the friendly hostname and discovery name for one launch:
+
+```powershell
+$env:LOCAL_HOSTNAME = "sendit"
+$env:SERVICE_NAME = "My Send-it-easy"
+npm start
+```
+
+That produces a friendly address like `http://sendit.local:8080`. Use letters, numbers, and hyphens for the hostname.
+
 ## Configuration
 
 The defaults are suitable for a home network:
@@ -56,6 +74,7 @@ The defaults are suitable for a home network:
 - Login session: expires after 8 hours or when the user selects **Disconnect**
 - QR codes: generated locally in the terminal for each detected address
 - mDNS service name: `Send-it-easy` (override with `SERVICE_NAME=My-Share`)
-- Friendly hostname: based on the computer name, with `.local` appended
+- Friendly hostname: based on the computer name, with `.local` appended (override with `LOCAL_HOSTNAME=sendit`)
+- Network inspection: `npm run networks`
 
 The current version intentionally shares only the configured shared folder and limits individual files to 5 GB.
