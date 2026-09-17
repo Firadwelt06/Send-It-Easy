@@ -5,6 +5,7 @@ const os = require("os");
 const crypto = require("crypto");
 const { URL } = require("url");
 const qrcode = require("qrcode-terminal");
+const { Bonjour } = require("bonjour-service");
 
 const PORT = Number(process.env.PORT) || 8080;
 const HOST = process.env.HOST || "0.0.0.0";
@@ -14,6 +15,8 @@ const ACCESS_CODE = process.env.ACCESS_CODE || crypto.randomBytes(3).toString("h
 const MAX_FILE_SIZE = 5 * 1024 * 1024 * 1024;
 const SESSION_MAX_AGE = 8 * 60 * 60 * 1000;
 const HOTSPOT_ADDRESS = process.env.HOTSPOT_ADDRESS || "192.168.137.1";
+const SERVICE_NAME = process.env.SERVICE_NAME || "Send-it-easy";
+const LOCAL_HOSTNAME = `${os.hostname().toLowerCase().replace(/[^a-z0-9-]/g, "-")}.local`;
 const sessions = new Map();
 
 fs.mkdirSync(SHARED_DIR, { recursive: true });
@@ -39,6 +42,12 @@ function describeAddress(address) {
 function printConnection(address, label) {
   const url = `http://${address}:${PORT}`;
   console.log(`${label}: ${url}`);
+  qrcode.generate(url, { small: true });
+}
+
+function printFriendlyConnection() {
+  const url = `http://${LOCAL_HOSTNAME}:${PORT}`;
+  console.log(`Friendly address (mDNS, if supported): ${url}`);
   qrcode.generate(url, { small: true });
 }
 
@@ -251,9 +260,20 @@ const server = http.createServer((request, response) => {
 
 server.listen(PORT, HOST, () => {
   const addresses = getLocalAddresses();
+  const bonjour = new Bonjour();
+  const service = bonjour.publish({
+    name: SERVICE_NAME,
+    type: "http",
+    port: PORT,
+    host: LOCAL_HOSTNAME
+  });
+  service.on("error", (error) => {
+    console.error(`mDNS discovery is unavailable: ${error.message}`);
+  });
   console.log(`\nSend-it-easy is sharing: ${SHARED_DIR}`);
   console.log(`Access code: ${ACCESS_CODE}`);
   console.log(`This computer: http://localhost:${PORT}`);
+  printFriendlyConnection();
   if (process.platform === "win32" && !addresses.includes(HOTSPOT_ADDRESS)) {
     printConnection(HOTSPOT_ADDRESS, "Windows hotspot (when enabled)");
   }
