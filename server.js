@@ -1,4 +1,5 @@
 const http = require("http");
+const https = require("https");
 const { execFileSync } = require("child_process");
 const fs = require("fs");
 const path = require("path");
@@ -8,8 +9,10 @@ const { URL } = require("url");
 const qrcode = require("qrcode-terminal");
 const { Bonjour } = require("bonjour-service");
 const { WebSocketServer } = require("ws");
+const selfsigned = require("selfsigned");
 
 const PORT = Number(process.env.PORT) || 8080;
+const HTTPS_PORT = Number(process.env.HTTPS_PORT) || 8443;
 const HOST = process.env.HOST || "0.0.0.0";
 const SHARED_DIR = path.join(__dirname, "shared");
 const INDEX_FILE = path.join(__dirname, "public", "index.html");
@@ -83,6 +86,12 @@ function describeAddress(address) {
 function printConnection(address, label) {
   const url = `http://${address}:${PORT}`;
   console.log(`${label}: ${url}`);
+  qrcode.generate(url, { small: true });
+}
+
+function printSecureConnection(address, label) {
+  const url = `https://${address}:${HTTPS_PORT}`;
+  console.log(`Secure screen sharing: ${url}`);
   qrcode.generate(url, { small: true });
 }
 
@@ -236,8 +245,9 @@ function handleUpload(request, response, url) {
   });
 }
 
-const server = http.createServer((request, response) => {
-  const url = new URL(request.url, `http://${request.headers.host || "localhost"}`);
+function handleRequest(request, response) {
+  const protocol = request.socket.encrypted ? "https" : "http";
+  const url = new URL(request.url, `${protocol}://${request.headers.host || "localhost"}`);
 
   if (request.method === "GET" && url.pathname === "/") {
     serveIndex(response);
@@ -333,90 +343,32 @@ const server = http.createServer((request, response) => {
   }
 
   sendJson(response, 404, { error: "Not found." });
-});
+}
 
-server.listen(PORT, HOST, () => {
-  const addresses = getLocalAddresses();
-  const bonjour = new Bonjour();
-  const service = bonjour.publish({
-    name: SERVICE_NAME,
-    type: "http",
-    port: PORT,
-    host: LOCAL_HOSTNAME
-  });
-
-  const screenWss = new WebSocketServer({ noServer: true });
-
-  function sendSocket(socket, message) {
-    if (socket.readyState === 1) socket.send(JSON.stringify(message));
+const server = http.createServer(handleRequest);
+const certificate = selfsigned.generate(
+  [{ name: "commonName", value: "send-it-easy.local" }],
+  {
+    days: 30,
+    keySize: 2048,
+    algorithm: "sha256",
+    extensions: [
+      { name: "basicConstraints", cA: false },
+      { name: "subjectAltName", altNames: [
+        { type: 2, value: "send-it-easy.local" },
+        { type: 2, value: "localhost" },
+        ...getLocalAddresses().map((address) => ({ type: 7, ip: address })),
+        { type: 7, ip: HOTSPOT_ADDRESS }
+      ] }
+    ]
   }
+);
+const secureServer = https.createServer({ key: certificate.private, cert: certificate.cert }, handleRequest);
+const screenWss = new WebSocketServer({ noServer: true });
 
-  function closeScreenClient(socket) {
-    const client = screenClients.get(socket);
-    if (!client) return;
-    screenClients.delete(socket);
-    if (client.role === "host" && screenHost === socket) {
-      screenHost = null;
-      for (const viewer of screenClients.values()) {
-        if (viewer.role === "viewer") sendSocket(viewer.socket, { type: "screen-ended" });
-      }
-    }
-  }
-
-  screenWss.on("connection", (socket, request) => {
-    const token = getSessionToken(request);
-    if (!token) {
-      socket.close(1008, "Login required");
-      return;
-    }
-    const role = isHostSession(request) ? "host" : "viewer";
-    const client = { socket, role, id: crypto.randomBytes(6).toString("hex") };
-    screenClients.set(socket, client);
-    if (role === "host") screenHost = socket;
-    sendSocket(socket, { type: "connected", role, id: client.id });
-
-    socket.on("message", (raw) => {
-      let message;
-      try {
-        message = JSON.parse(raw.toString());
-      } catch {
-        return;
-      }
-      if (message.type === "request-viewer" && role === "viewer" && screenHost) {
-        sendSocket(screenHost, { type: "viewer-request", viewerId: client.id });
-        return;
-      }
-      if (message.type === "approve-viewer" && role === "host") {
-        const viewer = [...screenClients.values()].find((item) => item.id === message.viewerId && item.role === "viewer");
-        if (viewer) sendSocket(viewer.socket, { type: "viewer-approved" });
-        return;
-      }
-      if (message.type === "deny-viewer" && role === "host") {
-        const viewer = [...screenClients.values()].find((item) => item.id === message.viewerId && item.role === "viewer");
-        if (viewer) sendSocket(viewer.socket, { type: "viewer-denied" });
-        return;
-      }
-      if (message.type === "signal" && (role === "host" || role === "viewer")) {
-        if (role === "viewer" && screenHost) {
-          sendSocket(screenHost, { type: "signal", viewerId: client.id, data: message.data });
-        } else if (role === "host") {
-          const viewer = [...screenClients.values()].find((item) => item.id === message.viewerId);
-          if (viewer) sendSocket(viewer.socket, { type: "signal", data: message.data });
-        }
-        return;
-      }
-      if (message.type === "screen-ended" && role === "host") {
-        for (const viewer of screenClients.values()) {
-          if (viewer.role === "viewer") sendSocket(viewer.socket, { type: "screen-ended" });
-        }
-      }
-    });
-    socket.on("close", () => closeScreenClient(socket));
-    socket.on("error", () => closeScreenClient(socket));
-  });
-
-  server.on("upgrade", (request, socket, head) => {
-    const url = new URL(request.url, `http://${request.headers.host || "localhost"}`);
+function attachScreenWebSocket(targetServer) {
+  targetServer.on("upgrade", (request, socket, head) => {
+    const url = new URL(request.url, `${request.socket.encrypted ? "https" : "http"}://${request.headers.host || "localhost"}`);
     if (url.pathname !== "/ws") {
       socket.destroy();
       return;
@@ -425,18 +377,131 @@ server.listen(PORT, HOST, () => {
       screenWss.emit("connection", websocket, request);
     });
   });
+}
+
+function sendSocket(socket, message) {
+  if (socket.readyState === 1) socket.send(JSON.stringify(message));
+}
+
+function closeScreenClient(socket) {
+  const client = screenClients.get(socket);
+  if (!client) return;
+  screenClients.delete(socket);
+  if (client.role === "viewer" && screenHost) {
+    sendSocket(screenHost, { type: "viewer-disconnected", viewerId: client.id });
+  }
+  if (client.role === "host" && screenHost === socket) {
+    screenHost = null;
+    for (const viewer of screenClients.values()) {
+      if (viewer.role === "viewer") sendSocket(viewer.socket, { type: "screen-ended" });
+    }
+  }
+}
+
+screenWss.on("connection", (socket, request) => {
+  const token = getSessionToken(request);
+  if (!token) {
+    socket.close(1008, "Login required");
+    return;
+  }
+  const role = isHostSession(request) ? "host" : "viewer";
+  const client = { socket, role, id: crypto.randomBytes(6).toString("hex") };
+  screenClients.set(socket, client);
+  if (role === "host") screenHost = socket;
+  sendSocket(socket, { type: "connected", role, id: client.id });
+  if (role === "viewer" && screenHost && screenHost !== socket) {
+    sendSocket(screenHost, { type: "viewer-connected", viewerId: client.id });
+  } else if (role === "host") {
+    for (const existing of screenClients.values()) {
+      if (existing.role === "viewer") sendSocket(socket, { type: "viewer-connected", viewerId: existing.id });
+    }
+  }
+
+  socket.on("message", (raw) => {
+    let message;
+    try {
+      message = JSON.parse(raw.toString());
+    } catch {
+      return;
+    }
+    if (message.type === "request-viewer" && role === "viewer" && screenHost) {
+      sendSocket(screenHost, { type: "viewer-request", viewerId: client.id });
+      return;
+    }
+    if (message.type === "request-viewer-screen" && role === "host") {
+      const viewer = [...screenClients.values()].find((item) => item.id === message.viewerId && item.role === "viewer");
+      if (viewer) sendSocket(viewer.socket, { type: "host-screen-request", viewerId: viewer.id });
+      return;
+    }
+    if (message.type === "viewer-screen-approved" && role === "viewer" && screenHost) {
+      sendSocket(screenHost, { type: "viewer-screen-approved", viewerId: client.id });
+      return;
+    }
+    if (message.type === "viewer-screen-denied" && role === "viewer" && screenHost) {
+      sendSocket(screenHost, { type: "viewer-screen-denied", viewerId: client.id });
+      return;
+    }
+    if (message.type === "approve-viewer" && role === "host") {
+      const viewer = [...screenClients.values()].find((item) => item.id === message.viewerId && item.role === "viewer");
+      if (viewer) sendSocket(viewer.socket, { type: "viewer-approved" });
+      return;
+    }
+    if (message.type === "deny-viewer" && role === "host") {
+      const viewer = [...screenClients.values()].find((item) => item.id === message.viewerId && item.role === "viewer");
+      if (viewer) sendSocket(viewer.socket, { type: "viewer-denied" });
+      return;
+    }
+    if (message.type === "signal" && (role === "host" || role === "viewer")) {
+      if (role === "viewer" && screenHost) {
+        sendSocket(screenHost, { type: "signal", viewerId: client.id, channel: message.channel || "host-screen", data: message.data });
+      } else if (role === "host") {
+        const viewer = [...screenClients.values()].find((item) => item.id === message.viewerId);
+        if (viewer) sendSocket(viewer.socket, { type: "signal", channel: message.channel || "host-screen", data: message.data });
+      }
+      return;
+    }
+    if (message.type === "screen-ended" && role === "host") {
+      for (const viewer of screenClients.values()) {
+        if (viewer.role === "viewer") sendSocket(viewer.socket, { type: "screen-ended" });
+      }
+    }
+    if (message.type === "screen-ended" && role === "viewer" && screenHost) {
+      sendSocket(screenHost, { type: "reverse-screen-ended", viewerId: client.id });
+    }
+  });
+  socket.on("close", () => closeScreenClient(socket));
+  socket.on("error", () => closeScreenClient(socket));
+});
+
+attachScreenWebSocket(server);
+attachScreenWebSocket(secureServer);
+
+server.listen(PORT, HOST);
+secureServer.listen(HTTPS_PORT, HOST, () => {
+  const addresses = getLocalAddresses();
+  const bonjour = new Bonjour();
+  const service = bonjour.publish({
+    name: SERVICE_NAME,
+    type: "https",
+    port: HTTPS_PORT,
+    host: LOCAL_HOSTNAME
+  });
   service.on("error", (error) => {
     console.error(`mDNS discovery is unavailable: ${error.message}`);
   });
   console.log(`\nSend-it-easy is sharing: ${SHARED_DIR}`);
   console.log(`Access code: ${ACCESS_CODE}`);
   console.log(`This computer: http://localhost:${PORT}`);
+  console.log(`Secure screen sharing: https://localhost:${HTTPS_PORT}`);
   printFriendlyConnection();
   if (process.platform === "win32" && !addresses.includes(HOTSPOT_ADDRESS)) {
     printConnection(HOTSPOT_ADDRESS, "Windows hotspot (when enabled)");
+    printSecureConnection(HOTSPOT_ADDRESS, "Windows hotspot (when enabled)");
   }
   for (const address of addresses) {
     printConnection(address, describeAddress(address));
+    printSecureConnection(address, describeAddress(address));
   }
-  console.log("\nPress Ctrl+C to stop sharing. This disconnects all devices and stops the server.\n");
+  console.log("\nFor remote screen capture, use the HTTPS address. The browser will show a certificate warning for this local certificate; accept it on the connected device.");
+  console.log("Press Ctrl+C to stop sharing. This disconnects all devices and stops the server.\n");
 });

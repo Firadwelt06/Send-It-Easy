@@ -2,7 +2,7 @@
 
 A small browser-based file transfer server for devices on the same Wi-Fi network.
 
-Version 4 adds optional, host-approved browser screen sharing. It retains the Version 3.1 QR, mDNS, IP, and network inspection features.
+Version 4.2 supports host-approved screen sharing in both directions and provides HTTPS for browser screen-capture permissions. It retains the Version 3.1 QR, mDNS, IP, and network inspection features.
 
 ## Run
 
@@ -89,6 +89,20 @@ Screen sharing uses WebRTC and does not save video files or route the video thro
 4. Approve the request on the host laptop.
 5. Stop sharing from the host page when finished.
 
+The host can also select a connected device and choose **Request their screen**. The connected device must approve the request and choose what to share. The host then receives that device's live screen.
+
 The host must approve each viewer. The browser may show a permission prompt, and screen capture is supported only in browsers that provide `getDisplayMedia`. Remote devices use the normal hotspot, Wi-Fi, or friendly address to view.
 
+### Screen sharing requires HTTPS
+
+Remote browsers cannot capture their screen from a normal `http://192.168...` page. Use the **Secure screen sharing** URL printed at startup, for example:
+
+```text
+https://192.168.137.1:8443
+```
+
+The app creates a temporary local certificate and prints a QR code for the secure URL. Each device may show a certificate warning the first time; choose the browser's advanced option to continue to the site. The certificate is generated again when the server restarts. File transfer can continue using the normal HTTP address, but both devices should use the HTTPS address for screen sharing.
+
 If the host page shows **Request to view host screen** instead of **Share my screen**, refresh after logging in. The host page is now recognized through localhost, Wi-Fi, and hotspot addresses.
+
+The viewer screen includes browser-style controls for play/pause, audio volume, mute, fullscreen, and switching between **Fit view** (show the entire screen) and **Fill view** (crop to use more of the available area). Fullscreen availability depends on the browser and device.
