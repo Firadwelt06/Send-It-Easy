@@ -7,6 +7,7 @@ const crypto = require("crypto");
 const { URL } = require("url");
 const qrcode = require("qrcode-terminal");
 const { Bonjour } = require("bonjour-service");
+const { WebSocketServer } = require("ws");
 
 const PORT = Number(process.env.PORT) || 8080;
 const HOST = process.env.HOST || "0.0.0.0";
@@ -20,6 +21,8 @@ const SERVICE_NAME = process.env.SERVICE_NAME || "Send-it-easy";
 const HOSTNAME_BASE = process.env.LOCAL_HOSTNAME || os.hostname();
 const LOCAL_HOSTNAME = `${HOSTNAME_BASE.toLowerCase().replace(/[^a-z0-9-]/g, "-").replace(/^-+|-+$/g, "") || "send-it-easy"}.local`;
 const sessions = new Map();
+const screenClients = new Map();
+let screenHost = null;
 
 fs.mkdirSync(SHARED_DIR, { recursive: true });
 
@@ -95,17 +98,34 @@ if (process.argv.includes("--list-networks")) {
 }
 
 function getSession(request) {
+  return Boolean(getSessionToken(request));
+}
+
+function getSessionToken(request) {
   const cookie = request.headers.cookie || "";
   const token = cookie.split(";").map((part) => part.trim())
     .find((part) => part.startsWith("send_it_easy_session="))
     ?.split("=")[1];
-  if (!token || !sessions.has(token)) return false;
+  if (!token || !sessions.has(token)) return null;
   const expiresAt = sessions.get(token);
   if (expiresAt <= Date.now()) {
     sessions.delete(token);
-    return false;
+    return null;
   }
-  return true;
+  return token;
+}
+
+function isHostSession(request) {
+  return getSession(request) && (request.headers.cookie || "").includes("send_it_easy_host=1");
+}
+
+function isLoopback(request) {
+  return ["127.0.0.1", "::1", "::ffff:127.0.0.1"].includes(request.socket.remoteAddress);
+}
+
+function isLocalMachineRequest(request) {
+  const remoteAddress = request.socket.remoteAddress?.replace(/^::ffff:/, "");
+  return isLoopback(request) || getLocalAddresses().includes(remoteAddress);
 }
 
 function codesMatch(value) {
@@ -267,6 +287,20 @@ const server = http.createServer((request, response) => {
     return;
   }
 
+  if (request.method === "POST" && url.pathname === "/api/host-session") {
+    if (!getSession(request) || !isLocalMachineRequest(request)) {
+      sendJson(response, 403, { error: "Host controls are available only on the host computer." });
+      return;
+    }
+    response.writeHead(200, {
+      "Content-Type": "application/json; charset=utf-8",
+      "Set-Cookie": "send_it_easy_host=1; HttpOnly; SameSite=Strict; Max-Age=28800; Path=/",
+      "Cache-Control": "no-store"
+    });
+    response.end(JSON.stringify({ ok: true }));
+    return;
+  }
+
   if (!getSession(request)) {
     sendJson(response, 401, { error: "Enter the access code shown on the host computer." });
     return;
@@ -309,6 +343,87 @@ server.listen(PORT, HOST, () => {
     type: "http",
     port: PORT,
     host: LOCAL_HOSTNAME
+  });
+
+  const screenWss = new WebSocketServer({ noServer: true });
+
+  function sendSocket(socket, message) {
+    if (socket.readyState === 1) socket.send(JSON.stringify(message));
+  }
+
+  function closeScreenClient(socket) {
+    const client = screenClients.get(socket);
+    if (!client) return;
+    screenClients.delete(socket);
+    if (client.role === "host" && screenHost === socket) {
+      screenHost = null;
+      for (const viewer of screenClients.values()) {
+        if (viewer.role === "viewer") sendSocket(viewer.socket, { type: "screen-ended" });
+      }
+    }
+  }
+
+  screenWss.on("connection", (socket, request) => {
+    const token = getSessionToken(request);
+    if (!token) {
+      socket.close(1008, "Login required");
+      return;
+    }
+    const role = isHostSession(request) ? "host" : "viewer";
+    const client = { socket, role, id: crypto.randomBytes(6).toString("hex") };
+    screenClients.set(socket, client);
+    if (role === "host") screenHost = socket;
+    sendSocket(socket, { type: "connected", role, id: client.id });
+
+    socket.on("message", (raw) => {
+      let message;
+      try {
+        message = JSON.parse(raw.toString());
+      } catch {
+        return;
+      }
+      if (message.type === "request-viewer" && role === "viewer" && screenHost) {
+        sendSocket(screenHost, { type: "viewer-request", viewerId: client.id });
+        return;
+      }
+      if (message.type === "approve-viewer" && role === "host") {
+        const viewer = [...screenClients.values()].find((item) => item.id === message.viewerId && item.role === "viewer");
+        if (viewer) sendSocket(viewer.socket, { type: "viewer-approved" });
+        return;
+      }
+      if (message.type === "deny-viewer" && role === "host") {
+        const viewer = [...screenClients.values()].find((item) => item.id === message.viewerId && item.role === "viewer");
+        if (viewer) sendSocket(viewer.socket, { type: "viewer-denied" });
+        return;
+      }
+      if (message.type === "signal" && (role === "host" || role === "viewer")) {
+        if (role === "viewer" && screenHost) {
+          sendSocket(screenHost, { type: "signal", viewerId: client.id, data: message.data });
+        } else if (role === "host") {
+          const viewer = [...screenClients.values()].find((item) => item.id === message.viewerId);
+          if (viewer) sendSocket(viewer.socket, { type: "signal", data: message.data });
+        }
+        return;
+      }
+      if (message.type === "screen-ended" && role === "host") {
+        for (const viewer of screenClients.values()) {
+          if (viewer.role === "viewer") sendSocket(viewer.socket, { type: "screen-ended" });
+        }
+      }
+    });
+    socket.on("close", () => closeScreenClient(socket));
+    socket.on("error", () => closeScreenClient(socket));
+  });
+
+  server.on("upgrade", (request, socket, head) => {
+    const url = new URL(request.url, `http://${request.headers.host || "localhost"}`);
+    if (url.pathname !== "/ws") {
+      socket.destroy();
+      return;
+    }
+    screenWss.handleUpgrade(request, socket, head, (websocket) => {
+      screenWss.emit("connection", websocket, request);
+    });
   });
   service.on("error", (error) => {
     console.error(`mDNS discovery is unavailable: ${error.message}`);

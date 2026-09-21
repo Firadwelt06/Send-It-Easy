@@ -2,7 +2,7 @@
 
 A small browser-based file transfer server for devices on the same Wi-Fi network.
 
-Version 3.1 adds configurable local naming and network inspection, while retaining QR, mDNS, and IP fallbacks.
+Version 4 adds optional, host-approved browser screen sharing. It retains the Version 3.1 QR, mDNS, IP, and network inspection features.
 
 ## Run
 
@@ -78,3 +78,17 @@ The defaults are suitable for a home network:
 - Network inspection: `npm run networks`
 
 The current version intentionally shares only the configured shared folder and limits individual files to 5 GB.
+
+## Screen sharing
+
+Screen sharing uses WebRTC and does not save video files or route the video through the Send-it-easy server.
+
+1. On the host laptop, open `http://localhost:8080` or the host's own Wi-Fi/hotspot address and log in.
+2. In **Screen sharing**, select **Share my screen** and choose a window, tab, or entire display.
+3. On another logged-in device, select **Request to view host screen**.
+4. Approve the request on the host laptop.
+5. Stop sharing from the host page when finished.
+
+The host must approve each viewer. The browser may show a permission prompt, and screen capture is supported only in browsers that provide `getDisplayMedia`. Remote devices use the normal hotspot, Wi-Fi, or friendly address to view.
+
+If the host page shows **Request to view host screen** instead of **Share my screen**, refresh after logging in. The host page is now recognized through localhost, Wi-Fi, and hotspot addresses.

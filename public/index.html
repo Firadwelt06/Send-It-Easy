@@ -28,6 +28,11 @@
     .login input { box-sizing: border-box; width: 100%; margin: 18px 0 12px; padding: 13px 14px; border: 1px solid #526886; border-radius: 10px; background: #10131a; color: #edf1f7; font: 1.2rem ui-monospace, SFMono-Regular, Consolas, monospace; text-align: center; letter-spacing: .15em; }
     .topbar { display: flex; justify-content: space-between; gap: 16px; align-items: center; }
     .topbar h1 { font-size: clamp(2rem, 5vw, 3.5rem); }
+    .screen-controls { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+    .screen-video { width: 100%; max-height: 520px; background: #05070a; border-radius: 12px; margin-top: 16px; }
+    .request { margin-top: 12px; }
+    .pending { display: grid; gap: 8px; margin-top: 14px; }
+    .pending-item { display: flex; justify-content: space-between; gap: 12px; align-items: center; background: #202735; border-radius: 10px; padding: 10px 12px; }
   </style>
 </head>
 <body>
@@ -56,6 +61,24 @@
       <div class="error" id="error"></div>
     </section>
     <section>
+      <h2>Screen sharing</h2>
+      <p class="meta">The host chooses what to share. Video travels directly between browsers and is not saved.</p>
+      <div id="hostScreenControls" hidden>
+        <div class="screen-controls">
+          <button id="startScreen">Share my screen</button>
+          <button id="stopScreen" hidden>Stop sharing</button>
+        </div>
+        <div class="pending" id="pendingViewers"></div>
+        <video id="hostPreview" class="screen-video" autoplay muted playsinline hidden></video>
+      </div>
+      <div id="viewerScreenControls" hidden>
+        <button class="request" id="requestScreen">Request to view host screen</button>
+        <div class="status" id="screenStatus"></div>
+        <video id="viewerVideo" class="screen-video" autoplay playsinline hidden></video>
+      </div>
+      <div class="error" id="screenError"></div>
+    </section>
+    <section>
       <h2>Available files</h2>
       <div class="files" id="files"><div class="empty">Loading files…</div></div>
     </section>
@@ -70,12 +93,180 @@
     const progress = document.querySelector("#progress");
     const status = document.querySelector("#status");
     const error = document.querySelector("#error");
+    const hostScreenControls = document.querySelector("#hostScreenControls");
+    const viewerScreenControls = document.querySelector("#viewerScreenControls");
+    const startScreen = document.querySelector("#startScreen");
+    const stopScreen = document.querySelector("#stopScreen");
+    const requestScreen = document.querySelector("#requestScreen");
+    const pendingViewers = document.querySelector("#pendingViewers");
+    const hostPreview = document.querySelector("#hostPreview");
+    const viewerVideo = document.querySelector("#viewerVideo");
+    const screenStatus = document.querySelector("#screenStatus");
+    const screenError = document.querySelector("#screenError");
+    let screenSocket;
+    let isHost = false;
+    let hostStream;
+    const hostPeers = new Map();
+    let viewerPeerState;
 
-    function showApp() {
+    async function showApp() {
       loginView.hidden = true;
       appView.hidden = false;
       loadFiles().catch((reason) => error.textContent = reason.message);
+      await setupScreenSharing();
     }
+    async function setupScreenSharing() {
+      const hostResponse = await fetch("/api/host-session", { method: "POST" });
+      isHost = hostResponse.ok;
+      hostScreenControls.hidden = !isHost;
+      viewerScreenControls.hidden = isHost;
+      const protocol = location.protocol === "https:" ? "wss:" : "ws:";
+      screenSocket = new WebSocket(`${protocol}//${location.host}/ws`);
+      screenSocket.onopen = () => {
+        if (!isHost) screenStatus.textContent = "Connected. You can request the host screen.";
+      };
+      screenSocket.onclose = () => {
+        screenError.textContent = "Screen sharing connection closed. Refresh this page and try again.";
+      };
+      screenSocket.onmessage = handleScreenMessage;
+      screenSocket.onerror = () => screenError.textContent = "Screen sharing could not connect.";
+    }
+    function sendScreen(message) {
+      if (screenSocket?.readyState === WebSocket.OPEN) screenSocket.send(JSON.stringify(message));
+    }
+    function createHostPeer(viewerId) {
+      const peer = new RTCPeerConnection();
+      const state = { peer, remoteDescriptionSet: false, pendingCandidates: [] };
+      hostPeers.set(viewerId, state);
+      for (const track of hostStream.getTracks()) peer.addTrack(track, hostStream);
+      peer.onicecandidate = (event) => {
+        if (event.candidate) sendScreen({ type: "signal", viewerId, data: { candidate: event.candidate } });
+      };
+      peer.onconnectionstatechange = () => {
+        if (["failed", "disconnected"].includes(peer.connectionState)) {
+          screenError.textContent = `Viewer connection ${peer.connectionState}. Try stopping and starting screen sharing again.`;
+        }
+      };
+      peer.createOffer().then((offer) => peer.setLocalDescription(offer))
+        .then(() => sendScreen({ type: "signal", viewerId, data: { description: peer.localDescription } }));
+    }
+    function createViewerPeer() {
+      const peer = new RTCPeerConnection();
+      viewerPeerState = { peer, remoteDescriptionSet: false, pendingCandidates: [] };
+      peer.ontrack = (event) => {
+        viewerVideo.hidden = false;
+        viewerVideo.srcObject = event.streams[0];
+      };
+      peer.onicecandidate = (event) => {
+        if (event.candidate) sendScreen({ type: "signal", data: { candidate: event.candidate } });
+      };
+      peer.onconnectionstatechange = () => {
+        if (peer.connectionState === "connected") screenStatus.textContent = "Screen connected.";
+        if (["failed", "disconnected"].includes(peer.connectionState)) {
+          screenStatus.textContent = `Screen connection ${peer.connectionState}.`;
+        }
+      };
+      return viewerPeerState;
+    }
+    async function addPendingCandidates(state) {
+      for (const candidate of state.pendingCandidates.splice(0)) {
+        await state.peer.addIceCandidate(candidate);
+      }
+    }
+    async function setRemoteDescription(state, description) {
+      await state.peer.setRemoteDescription(description);
+      state.remoteDescriptionSet = true;
+      await addPendingCandidates(state);
+    }
+    async function addCandidate(state, candidate) {
+      if (!state.remoteDescriptionSet) {
+        state.pendingCandidates.push(candidate);
+        return;
+      }
+      await state.peer.addIceCandidate(candidate);
+    }
+    async function handleScreenMessage(event) {
+      const message = JSON.parse(event.data);
+      if (message.type === "viewer-request" && isHost) {
+        const row = document.createElement("div");
+        row.className = "pending-item";
+        row.dataset.viewerId = message.viewerId;
+        row.innerHTML = `<span>Device ${message.viewerId.slice(0, 6)} wants to view</span>`;
+        const approve = document.createElement("button");
+        approve.textContent = "Allow";
+        approve.onclick = () => {
+          sendScreen({ type: "approve-viewer", viewerId: message.viewerId });
+          createHostPeer(message.viewerId);
+          row.remove();
+        };
+        const deny = document.createElement("button");
+        deny.textContent = "Deny";
+        deny.onclick = () => {
+          sendScreen({ type: "deny-viewer", viewerId: message.viewerId });
+          row.remove();
+        };
+        row.append(approve, deny);
+        pendingViewers.append(row);
+      } else if (message.type === "viewer-approved" && !isHost) {
+        screenStatus.textContent = "The host approved your request.";
+        createViewerPeer();
+      } else if (message.type === "viewer-denied" && !isHost) {
+        screenStatus.textContent = "The host denied your request.";
+        requestScreen.disabled = false;
+      } else if (message.type === "signal") {
+        if (isHost) {
+          const state = hostPeers.get(message.viewerId);
+          if (!state) return;
+          if (message.data.description) await setRemoteDescription(state, message.data.description);
+          if (message.data.candidate) await addCandidate(state, message.data.candidate);
+        } else {
+          const state = viewerPeerState || createViewerPeer();
+          if (message.data.description?.type === "offer") {
+            await setRemoteDescription(state, message.data.description);
+            const answer = await state.peer.createAnswer();
+            await state.peer.setLocalDescription(answer);
+            sendScreen({ type: "signal", data: { description: state.peer.localDescription } });
+          } else if (message.data.description) {
+            await setRemoteDescription(state, message.data.description);
+          } else if (message.data.candidate) {
+            await addCandidate(state, message.data.candidate);
+          }
+        }
+      } else if (message.type === "screen-ended" && !isHost) {
+        viewerVideo.hidden = true;
+        viewerVideo.srcObject = null;
+        screenStatus.textContent = "The host stopped sharing.";
+      }
+    }
+    startScreen.addEventListener("click", async () => {
+      screenError.textContent = "";
+      try {
+        hostStream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
+        hostPreview.srcObject = hostStream;
+        hostPreview.hidden = false;
+        startScreen.hidden = true;
+        stopScreen.hidden = false;
+        hostStream.getVideoTracks()[0].onended = () => stopScreen.click();
+      } catch (reason) {
+        screenError.textContent = `Screen sharing was not started: ${reason.message}`;
+      }
+    });
+    stopScreen.addEventListener("click", () => {
+      hostStream?.getTracks().forEach((track) => track.stop());
+      hostStream = null;
+      for (const state of hostPeers.values()) state.peer.close();
+      hostPeers.clear();
+      hostPreview.srcObject = null;
+      hostPreview.hidden = true;
+      startScreen.hidden = false;
+      stopScreen.hidden = true;
+      sendScreen({ type: "screen-ended" });
+    });
+    requestScreen.addEventListener("click", () => {
+      requestScreen.disabled = true;
+      screenStatus.textContent = "Waiting for the host to approve…";
+      sendScreen({ type: "request-viewer" });
+    });
     async function checkSession() {
       const response = await fetch("/api/files");
       if (response.ok) showApp();
