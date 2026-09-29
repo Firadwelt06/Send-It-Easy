@@ -23,6 +23,10 @@ const HOTSPOT_ADDRESS = process.env.HOTSPOT_ADDRESS || "192.168.137.1";
 const SERVICE_NAME = process.env.SERVICE_NAME || "Send-it-easy";
 const HOSTNAME_BASE = process.env.LOCAL_HOSTNAME || os.hostname();
 const LOCAL_HOSTNAME = `${HOSTNAME_BASE.toLowerCase().replace(/[^a-z0-9-]/g, "-").replace(/^-+|-+$/g, "") || "send-it-easy"}.local`;
+const CERT_DIR = path.join(__dirname, "certs");
+const CERT_KEY = path.join(CERT_DIR, "server-key.pem");
+const CERT_FILE = path.join(CERT_DIR, "server-cert.pem");
+const CERT_DER_FILE = path.join(CERT_DIR, "server-cert.cer");
 const sessions = new Map();
 const screenClients = new Map();
 let screenHost = null;
@@ -84,19 +88,13 @@ function describeAddress(address) {
 }
 
 function printConnection(address, label) {
-  const url = `http://${address}:${PORT}`;
+  const url = `https://${address}:${HTTPS_PORT}`;
   console.log(`${label}: ${url}`);
   qrcode.generate(url, { small: true });
 }
 
-function printSecureConnection(address, label) {
-  const url = `https://${address}:${HTTPS_PORT}`;
-  console.log(`Secure screen sharing: ${url}`);
-  qrcode.generate(url, { small: true });
-}
-
 function printFriendlyConnection() {
-  const url = `http://${LOCAL_HOSTNAME}:${PORT}`;
+  const url = `https://${LOCAL_HOSTNAME}:${HTTPS_PORT}`;
   console.log(`Friendly address (mDNS, if supported): ${url}`);
   qrcode.generate(url, { small: true });
 }
@@ -246,8 +244,34 @@ function handleUpload(request, response, url) {
 }
 
 function handleRequest(request, response) {
-  const protocol = request.socket.encrypted ? "https" : "http";
-  const url = new URL(request.url, `${protocol}://${request.headers.host || "localhost"}`);
+  if (!request.socket.encrypted) {
+    let secureUrl;
+    try {
+      secureUrl = new URL(request.url, `http://${request.headers.host || "localhost"}`);
+      secureUrl.protocol = "https:";
+      secureUrl.port = String(HTTPS_PORT);
+    } catch {
+      sendJson(response, 400, { error: "Invalid request URL." });
+      return;
+    }
+    response.writeHead(308, {
+      Location: secureUrl.toString(),
+      "Cache-Control": "no-store"
+    });
+    response.end();
+    return;
+  }
+  const url = new URL(request.url, `https://${request.headers.host || "localhost"}`);
+
+  if (request.method === "GET" && url.pathname === "/server-cert.cer") {
+    response.writeHead(200, {
+      "Content-Type": "application/pkix-cert",
+      "Content-Disposition": 'attachment; filename="send-it-easy-local-ca.cer"',
+      "Cache-Control": "no-store"
+    });
+    fs.createReadStream(CERT_DER_FILE).pipe(response);
+    return;
+  }
 
   if (request.method === "GET" && url.pathname === "/") {
     serveIndex(response);
@@ -274,7 +298,7 @@ function handleRequest(request, response) {
       sessions.set(token, Date.now() + SESSION_MAX_AGE);
       response.writeHead(200, {
         "Content-Type": "application/json; charset=utf-8",
-        "Set-Cookie": `send_it_easy_session=${token}; HttpOnly; SameSite=Strict; Max-Age=${SESSION_MAX_AGE / 1000}; Path=/`,
+        "Set-Cookie": `send_it_easy_session=${token}; HttpOnly; SameSite=Strict; Max-Age=${SESSION_MAX_AGE / 1000}; Path=/; Secure`,
         "Cache-Control": "no-store"
       });
       response.end(JSON.stringify({ ok: true }));
@@ -290,7 +314,7 @@ function handleRequest(request, response) {
     if (token) sessions.delete(token);
     response.writeHead(200, {
       "Content-Type": "application/json; charset=utf-8",
-      "Set-Cookie": "send_it_easy_session=; HttpOnly; SameSite=Strict; Max-Age=0; Path=/",
+      "Set-Cookie": "send_it_easy_session=; HttpOnly; SameSite=Strict; Max-Age=0; Path=/; Secure",
       "Cache-Control": "no-store"
     });
     response.end(JSON.stringify({ ok: true }));
@@ -304,7 +328,7 @@ function handleRequest(request, response) {
     }
     response.writeHead(200, {
       "Content-Type": "application/json; charset=utf-8",
-      "Set-Cookie": "send_it_easy_host=1; HttpOnly; SameSite=Strict; Max-Age=28800; Path=/",
+      "Set-Cookie": "send_it_easy_host=1; HttpOnly; SameSite=Strict; Max-Age=28800; Path=/; Secure",
       "Cache-Control": "no-store"
     });
     response.end(JSON.stringify({ ok: true }));
@@ -346,28 +370,51 @@ function handleRequest(request, response) {
 }
 
 const server = http.createServer(handleRequest);
-const certificate = selfsigned.generate(
-  [{ name: "commonName", value: "send-it-easy.local" }],
-  {
-    days: 30,
-    keySize: 2048,
-    algorithm: "sha256",
-    extensions: [
-      { name: "basicConstraints", cA: false },
-      { name: "subjectAltName", altNames: [
-        { type: 2, value: "send-it-easy.local" },
-        { type: 2, value: "localhost" },
-        ...getLocalAddresses().map((address) => ({ type: 7, ip: address })),
-        { type: 7, ip: HOTSPOT_ADDRESS }
-      ] }
-    ]
+function getOrCreateCertificate() {
+  fs.mkdirSync(CERT_DIR, { recursive: true });
+  let pair;
+  if (fs.existsSync(CERT_KEY) && fs.existsSync(CERT_FILE)) {
+    pair = {
+      key: fs.readFileSync(CERT_KEY),
+      cert: fs.readFileSync(CERT_FILE)
+    };
+  } else {
+    const certificate = selfsigned.generate(
+      [{ name: "commonName", value: LOCAL_HOSTNAME }],
+      {
+        days: 3650,
+        keySize: 2048,
+        algorithm: "sha256",
+        extensions: [
+          { name: "basicConstraints", cA: true },
+          { name: "subjectAltName", altNames: [
+            { type: 2, value: LOCAL_HOSTNAME },
+            { type: 2, value: "localhost" },
+            ...getLocalAddresses().map((address) => ({ type: 7, ip: address })),
+            { type: 7, ip: HOTSPOT_ADDRESS }
+          ] }
+        ]
+      }
+    );
+    pair = { key: certificate.private, cert: certificate.cert };
+    fs.writeFileSync(CERT_KEY, pair.key, { mode: 0o600 });
+    fs.writeFileSync(CERT_FILE, pair.cert);
   }
-);
-const secureServer = https.createServer({ key: certificate.private, cert: certificate.cert }, handleRequest);
+  if (!fs.existsSync(CERT_DER_FILE)) {
+    fs.writeFileSync(CERT_DER_FILE, new crypto.X509Certificate(pair.cert).raw);
+  }
+  return pair;
+}
+const secureServer = https.createServer(getOrCreateCertificate(), handleRequest);
 const screenWss = new WebSocketServer({ noServer: true });
 
 function attachScreenWebSocket(targetServer) {
   targetServer.on("upgrade", (request, socket, head) => {
+    if (!request.socket.encrypted) {
+      socket.write("HTTP/1.1 426 Upgrade Required\r\nConnection: close\r\n\r\n");
+      socket.destroy();
+      return;
+    }
     const url = new URL(request.url, `${request.socket.encrypted ? "https" : "http"}://${request.headers.host || "localhost"}`);
     if (url.pathname !== "/ws") {
       socket.destroy();
@@ -428,19 +475,6 @@ screenWss.on("connection", (socket, request) => {
       sendSocket(screenHost, { type: "viewer-request", viewerId: client.id });
       return;
     }
-    if (message.type === "request-viewer-screen" && role === "host") {
-      const viewer = [...screenClients.values()].find((item) => item.id === message.viewerId && item.role === "viewer");
-      if (viewer) sendSocket(viewer.socket, { type: "host-screen-request", viewerId: viewer.id });
-      return;
-    }
-    if (message.type === "viewer-screen-approved" && role === "viewer" && screenHost) {
-      sendSocket(screenHost, { type: "viewer-screen-approved", viewerId: client.id });
-      return;
-    }
-    if (message.type === "viewer-screen-denied" && role === "viewer" && screenHost) {
-      sendSocket(screenHost, { type: "viewer-screen-denied", viewerId: client.id });
-      return;
-    }
     if (message.type === "approve-viewer" && role === "host") {
       const viewer = [...screenClients.values()].find((item) => item.id === message.viewerId && item.role === "viewer");
       if (viewer) sendSocket(viewer.socket, { type: "viewer-approved" });
@@ -452,11 +486,12 @@ screenWss.on("connection", (socket, request) => {
       return;
     }
     if (message.type === "signal" && (role === "host" || role === "viewer")) {
+      if (message.channel && message.channel !== "host-screen") return;
       if (role === "viewer" && screenHost) {
-        sendSocket(screenHost, { type: "signal", viewerId: client.id, channel: message.channel || "host-screen", data: message.data });
+        sendSocket(screenHost, { type: "signal", viewerId: client.id, data: message.data });
       } else if (role === "host") {
         const viewer = [...screenClients.values()].find((item) => item.id === message.viewerId);
-        if (viewer) sendSocket(viewer.socket, { type: "signal", channel: message.channel || "host-screen", data: message.data });
+        if (viewer) sendSocket(viewer.socket, { type: "signal", data: message.data });
       }
       return;
     }
@@ -464,9 +499,6 @@ screenWss.on("connection", (socket, request) => {
       for (const viewer of screenClients.values()) {
         if (viewer.role === "viewer") sendSocket(viewer.socket, { type: "screen-ended" });
       }
-    }
-    if (message.type === "screen-ended" && role === "viewer" && screenHost) {
-      sendSocket(screenHost, { type: "reverse-screen-ended", viewerId: client.id });
     }
   });
   socket.on("close", () => closeScreenClient(socket));
@@ -491,17 +523,15 @@ secureServer.listen(HTTPS_PORT, HOST, () => {
   });
   console.log(`\nSend-it-easy is sharing: ${SHARED_DIR}`);
   console.log(`Access code: ${ACCESS_CODE}`);
-  console.log(`This computer: http://localhost:${PORT}`);
-  console.log(`Secure screen sharing: https://localhost:${HTTPS_PORT}`);
+  console.log(`Open Send-it-easy: https://localhost:${HTTPS_PORT}`);
+  console.log(`Local certificate: ${CERT_FILE}`);
   printFriendlyConnection();
   if (process.platform === "win32" && !addresses.includes(HOTSPOT_ADDRESS)) {
     printConnection(HOTSPOT_ADDRESS, "Windows hotspot (when enabled)");
-    printSecureConnection(HOTSPOT_ADDRESS, "Windows hotspot (when enabled)");
   }
   for (const address of addresses) {
     printConnection(address, describeAddress(address));
-    printSecureConnection(address, describeAddress(address));
   }
-  console.log("\nFor remote screen capture, use the HTTPS address. The browser will show a certificate warning for this local certificate; accept it on the connected device.");
+  console.log(`\nAll HTTP requests on port ${PORT} automatically redirect to HTTPS. Accept the local certificate warning once on each device.`);
   console.log("Press Ctrl+C to stop sharing. This disconnects all devices and stops the server.\n");
 });

@@ -51,6 +51,7 @@
         <button type="submit">Connect</button>
         <div class="error" id="loginError"></div>
       </form>
+      <p class="meta"><a href="/server-cert.cer">Download this host's certificate</a> to trust it on this device and remove the browser warning.</p>
     </section>
   </main>
   <main id="appView" hidden>
@@ -82,24 +83,9 @@
             <button id="hostFit" type="button">Fill view</button>
           </div>
         </div>
-        <div class="screen-frame" id="reverseFrame" hidden>
-          <video id="reverseVideo" class="screen-video" autoplay playsinline controls></video>
-          <div class="screen-tools">
-            <button id="reverseFullscreen" type="button">Fullscreen</button>
-            <button id="reverseFit" type="button">Fill view</button>
-            <button id="reverseMute" type="button">Mute</button>
-          </div>
-        </div>
       </div>
       <div id="viewerScreenControls" hidden>
         <button class="request" id="requestScreen">Request to view host screen</button>
-        <div class="pending" id="hostScreenRequest" hidden>
-          <span>The host wants to view your screen.</span>
-          <div class="screen-controls">
-            <button id="allowHostScreen" type="button">Allow</button>
-            <button id="denyHostScreen" type="button">Deny</button>
-          </div>
-        </div>
         <div class="status" id="screenStatus"></div>
         <div class="screen-frame" id="viewerFrame" hidden>
           <video id="viewerVideo" class="screen-video" autoplay playsinline controls></video>
@@ -143,25 +129,14 @@
     const hostFit = document.querySelector("#hostFit");
     const viewerFit = document.querySelector("#viewerFit");
     const viewerMute = document.querySelector("#viewerMute");
-    const reverseFrame = document.querySelector("#reverseFrame");
-    const reverseVideo = document.querySelector("#reverseVideo");
-    const reverseFullscreen = document.querySelector("#reverseFullscreen");
-    const reverseFit = document.querySelector("#reverseFit");
-    const reverseMute = document.querySelector("#reverseMute");
-    const hostScreenRequest = document.querySelector("#hostScreenRequest");
-    const allowHostScreen = document.querySelector("#allowHostScreen");
-    const denyHostScreen = document.querySelector("#denyHostScreen");
     const screenStatus = document.querySelector("#screenStatus");
     const screenError = document.querySelector("#screenError");
     let screenSocket;
     let isHost = false;
     let hostStream;
     const hostPeers = new Map();
-    const reversePeers = new Map();
     const viewerIds = new Set();
     let viewerPeerState;
-    let reverseStream;
-    let reversePeerState;
 
     async function showApp() {
       loginView.hidden = true;
@@ -174,8 +149,10 @@
       isHost = hostResponse.ok;
       hostScreenControls.hidden = !isHost;
       viewerScreenControls.hidden = isHost;
-      if (!window.isSecureContext || !navigator.mediaDevices?.getDisplayMedia) {
-        screenError.textContent = "Screen capture requires the HTTPS address. Reopen this page using the Secure screen sharing URL printed by the host.";
+      if (!window.isSecureContext) {
+        screenError.textContent = "This page is not secure yet. Accept the local certificate warning and use the Send-it-easy address printed by the host.";
+      } else if (!navigator.mediaDevices?.getDisplayMedia) {
+        screenError.textContent = "This browser does not support screen capture. Try an up-to-date desktop version of Chrome, Edge, or Firefox.";
       }
       const protocol = location.protocol === "https:" ? "wss:" : "ws:";
       screenSocket = new WebSocket(`${protocol}//${location.host}/ws`);
@@ -261,49 +238,14 @@
       row.dataset.viewerId = viewerId;
       const label = document.createElement("span");
       label.textContent = `Connected device ${viewerId.slice(0, 6)}`;
-      const request = document.createElement("button");
-      request.textContent = "Request their screen";
-      request.onclick = () => {
-        request.disabled = true;
-        request.textContent = "Waiting for approval…";
-        sendScreen({ type: "request-viewer-screen", viewerId });
-      };
-      row.append(label, request);
+      row.append(label);
       connectedViewers.append(row);
     }
     function removeConnectedViewer(viewerId) {
       viewerIds.delete(viewerId);
       connectedViewers.querySelector(`[data-viewer-id="${viewerId}"]`)?.remove();
-      reversePeers.get(viewerId)?.peer.close();
-      reversePeers.delete(viewerId);
-    }
-    function createReverseHostPeer(viewerId) {
-      const peer = new RTCPeerConnection();
-      const state = { peer, remoteDescriptionSet: false, pendingCandidates: [] };
-      reversePeers.set(viewerId, state);
-      peer.ontrack = (event) => {
-        reverseFrame.hidden = false;
-        reverseVideo.srcObject = event.streams[0];
-      };
-      peer.onicecandidate = (event) => {
-        if (event.candidate) sendScreen({ type: "signal", viewerId, channel: "reverse-screen", data: { candidate: event.candidate } });
-      };
-      peer.onconnectionstatechange = () => {
-        if (peer.connectionState === "connected") screenStatus.textContent = "Connected device screen connected.";
-        if (["failed", "disconnected"].includes(peer.connectionState)) {
-          screenError.textContent = "The connected device screen connection failed.";
-        }
-      };
-      return state;
-    }
-    function createReverseViewerPeer() {
-      const peer = new RTCPeerConnection();
-      reversePeerState = { peer, remoteDescriptionSet: false, pendingCandidates: [] };
-      for (const track of reverseStream.getTracks()) peer.addTrack(track, reverseStream);
-      peer.onicecandidate = (event) => {
-        if (event.candidate) sendScreen({ type: "signal", channel: "reverse-screen", data: { candidate: event.candidate } });
-      };
-      return reversePeerState;
+      hostPeers.get(viewerId)?.peer.close();
+      hostPeers.delete(viewerId);
     }
     async function handleScreenMessage(event) {
       const message = JSON.parse(event.data);
@@ -311,9 +253,6 @@
         addConnectedViewer(message.viewerId);
       } else if (message.type === "viewer-disconnected" && isHost) {
         removeConnectedViewer(message.viewerId);
-      } else if (message.type === "host-screen-request" && !isHost) {
-        hostScreenRequest.hidden = false;
-        screenStatus.textContent = "The host is asking to view your screen.";
       } else if (message.type === "viewer-request" && isHost) {
         const row = document.createElement("div");
         row.className = "pending-item";
@@ -340,36 +279,8 @@
       } else if (message.type === "viewer-denied" && !isHost) {
         screenStatus.textContent = "The host denied your request.";
         requestScreen.disabled = false;
-      } else if (message.type === "viewer-screen-approved" && isHost) {
-        const state = createReverseHostPeer(message.viewerId);
-        screenStatus.textContent = "Waiting for the connected device screen…";
-        reversePeers.set(message.viewerId, state);
-      } else if (message.type === "viewer-screen-denied" && isHost) {
-        screenStatus.textContent = "The connected device denied screen sharing.";
-      } else if (message.type === "reverse-screen-ended" && isHost) {
-        reverseFrame.hidden = true;
-        reverseVideo.srcObject = null;
-        screenStatus.textContent = "The connected device stopped sharing.";
       } else if (message.type === "signal") {
-        if (message.channel === "reverse-screen" && isHost) {
-          const state = reversePeers.get(message.viewerId);
-          if (!state) return;
-          if (message.data.description?.type === "offer") {
-            await setRemoteDescription(state, message.data.description);
-            const answer = await state.peer.createAnswer();
-            await state.peer.setLocalDescription(answer);
-            sendScreen({ type: "signal", viewerId: message.viewerId, channel: "reverse-screen", data: { description: state.peer.localDescription } });
-          } else if (message.data.description) {
-            await setRemoteDescription(state, message.data.description);
-          } else if (message.data.candidate) {
-            await addCandidate(state, message.data.candidate);
-          }
-        } else if (message.channel === "reverse-screen" && !isHost) {
-          const state = reversePeerState;
-          if (!state) return;
-          if (message.data.description) await setRemoteDescription(state, message.data.description);
-          if (message.data.candidate) await addCandidate(state, message.data.candidate);
-        } else if (isHost) {
+        if (isHost) {
           const state = hostPeers.get(message.viewerId);
           if (!state) return;
           if (message.data.description) await setRemoteDescription(state, message.data.description);
@@ -388,9 +299,12 @@
           }
         }
       } else if (message.type === "screen-ended" && !isHost) {
+        viewerPeerState?.peer.close();
+        viewerPeerState = null;
         viewerVideo.hidden = true;
         viewerFrame.hidden = true;
         viewerVideo.srcObject = null;
+        requestScreen.disabled = false;
         screenStatus.textContent = "The host stopped sharing.";
       }
     }
@@ -398,7 +312,9 @@
       screenError.textContent = "";
       try {
         if (!navigator.mediaDevices?.getDisplayMedia) {
-          throw new Error("This browser page is not secure. Use the HTTPS address printed by the host.");
+          throw new Error(window.isSecureContext
+            ? "This browser does not support screen capture. Try an up-to-date desktop version of Chrome, Edge, or Firefox."
+            : "This page is not secure yet. Accept the local certificate warning and reopen the Send-it-easy address.");
         }
         hostStream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
         hostPreview.srcObject = hostStream;
@@ -426,30 +342,6 @@
       screenStatus.textContent = "Waiting for the host to approve…";
       sendScreen({ type: "request-viewer" });
     });
-    allowHostScreen.addEventListener("click", async () => {
-      hostScreenRequest.hidden = true;
-      try {
-        if (!navigator.mediaDevices?.getDisplayMedia) {
-          throw new Error("This browser page is not secure. Reopen the HTTPS address printed by the host.");
-        }
-        reverseStream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
-        const state = createReverseViewerPeer();
-        const offer = await state.peer.createOffer();
-        await state.peer.setLocalDescription(offer);
-        sendScreen({ type: "viewer-screen-approved" });
-        sendScreen({ type: "signal", channel: "reverse-screen", data: { description: state.peer.localDescription } });
-        reverseStream.getVideoTracks()[0].onended = () => {
-          reverseStream.getTracks().forEach((track) => track.stop());
-          sendScreen({ type: "screen-ended" });
-        };
-      } catch (reason) {
-        screenError.textContent = `Screen sharing was not started: ${reason.message}`;
-      }
-    });
-    denyHostScreen.addEventListener("click", () => {
-      hostScreenRequest.hidden = true;
-      sendScreen({ type: "viewer-screen-denied" });
-    });
     hostFullscreen.addEventListener("click", () => enterFullscreen(hostFrame));
     viewerFullscreen.addEventListener("click", () => enterFullscreen(viewerFrame));
     hostFit.addEventListener("click", () => toggleFit(hostPreview, hostFit));
@@ -457,12 +349,6 @@
     viewerMute.addEventListener("click", () => {
       viewerVideo.muted = !viewerVideo.muted;
       viewerMute.textContent = viewerVideo.muted ? "Unmute" : "Mute";
-    });
-    reverseFullscreen.addEventListener("click", () => enterFullscreen(reverseFrame));
-    reverseFit.addEventListener("click", () => toggleFit(reverseVideo, reverseFit));
-    reverseMute.addEventListener("click", () => {
-      reverseVideo.muted = !reverseVideo.muted;
-      reverseMute.textContent = reverseVideo.muted ? "Unmute" : "Mute";
     });
     async function checkSession() {
       const response = await fetch("/api/files");

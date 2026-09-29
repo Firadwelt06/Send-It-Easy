@@ -1,2 +1,4 @@
 shared/*
 !shared\.gitkeep
+certs/*
+!certs\.gitkeep
